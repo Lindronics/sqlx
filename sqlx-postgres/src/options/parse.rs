@@ -89,6 +89,8 @@ impl PgConnectOptions {
 
                 "application_name" => options = options.application_name(&value),
 
+                "replication" => options = options.replication(&value),
+
                 "options" => {
                     if let Some(options) = options.options.as_mut() {
                         options.push(' ');
@@ -159,6 +161,11 @@ impl PgConnectOptions {
         if let Some(ssl_client_key) = &self.ssl_client_key {
             url.query_pairs_mut()
                 .append_pair("sslkey", &ssl_client_key.to_string());
+        }
+
+        if let Some(replication) = &self.replication {
+            url.query_pairs_mut()
+                .append_pair("replication", &replication.to_string());
         }
 
         url.query_pairs_mut().append_pair(
