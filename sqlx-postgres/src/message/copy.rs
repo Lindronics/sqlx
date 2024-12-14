@@ -8,7 +8,7 @@ use sqlx_core::Error;
 use std::num::Saturating;
 use std::ops::Deref;
 
-/// The same structure is sent for both `CopyInResponse` and `CopyOutResponse`
+/// The same structure is sent for `CopyInResponse`, `CopyOutResponse` and `CopyBothResponse`.
 pub struct CopyResponseData {
     pub format: i8,
     pub num_columns: i16,
@@ -19,6 +19,8 @@ pub struct CopyInResponse(pub CopyResponseData);
 
 #[allow(dead_code)]
 pub struct CopyOutResponse(pub CopyResponseData);
+
+pub struct CopyBothResponse(pub CopyResponseData);
 
 pub struct CopyData<B>(pub B);
 
@@ -55,6 +57,15 @@ impl BackendMessage for CopyInResponse {
 
 impl BackendMessage for CopyOutResponse {
     const FORMAT: BackendMessageFormat = BackendMessageFormat::CopyOutResponse;
+
+    #[inline(always)]
+    fn decode_body(buf: Bytes) -> std::result::Result<Self, Error> {
+        Ok(Self(CopyResponseData::decode(buf)?))
+    }
+}
+
+impl BackendMessage for CopyBothResponse {
+    const FORMAT: BackendMessageFormat = BackendMessageFormat::CopyBothResponse;
 
     #[inline(always)]
     fn decode_body(buf: Bytes) -> std::result::Result<Self, Error> {

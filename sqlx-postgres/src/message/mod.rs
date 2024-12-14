@@ -22,6 +22,7 @@ mod parse_complete;
 mod password;
 mod query;
 mod ready_for_query;
+mod replication;
 mod response;
 mod row_description;
 mod sasl;
@@ -35,7 +36,10 @@ pub use backend_key_data::BackendKeyData;
 pub use bind::Bind;
 pub use close::Close;
 pub use command_complete::CommandComplete;
-pub use copy::{CopyData, CopyDone, CopyFail, CopyInResponse, CopyOutResponse, CopyResponseData};
+pub use copy::{
+    CopyBothResponse, CopyData, CopyDone, CopyFail, CopyInResponse, CopyOutResponse,
+    CopyResponseData,
+};
 pub use data_row::DataRow;
 pub use describe::Describe;
 pub use execute::Execute;
@@ -99,6 +103,7 @@ pub enum BackendMessageFormat {
     CopyDone,
     CopyInResponse,
     CopyOutResponse,
+    CopyBothResponse,
     DataRow,
     EmptyQueryResponse,
     ErrorResponse,
@@ -155,6 +160,7 @@ impl BackendMessageFormat {
             b'c' => BackendMessageFormat::CopyDone,
             b'G' => BackendMessageFormat::CopyInResponse,
             b'H' => BackendMessageFormat::CopyOutResponse,
+            b'W' => BackendMessageFormat::CopyBothResponse,
             b'D' => BackendMessageFormat::DataRow,
             b'E' => BackendMessageFormat::ErrorResponse,
             b'I' => BackendMessageFormat::EmptyQueryResponse,
