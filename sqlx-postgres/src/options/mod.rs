@@ -100,6 +100,7 @@ pub struct PgConnectOptions {
     pub(crate) ssl_client_key: Option<CertificateInput>,
     pub(crate) statement_cache_capacity: usize,
     pub(crate) application_name: Option<String>,
+    pub(crate) replication: Option<String>,
     pub(crate) log_settings: LogSettings,
     pub(crate) extra_float_digits: Option<Cow<'static, str>>,
     pub(crate) options: Option<String>,
@@ -166,6 +167,7 @@ impl PgConnectOptions {
                 .unwrap_or_default(),
             statement_cache_capacity: 100,
             application_name: var("PGAPPNAME").ok(),
+            replication: None,
             extra_float_digits: Some("2".into()),
             log_settings: Default::default(),
             options: var("PGOPTIONS").ok(),
@@ -346,7 +348,7 @@ impl PgConnectOptions {
     /// -----BEGIN CERTIFICATE-----
     /// <Certificate data here.>
     /// -----END CERTIFICATE-----";
-    ///    
+    ///
     /// let options = PgConnectOptions::new()
     ///     // Providing a CA certificate with less than VerifyCa is pointless
     ///     .ssl_mode(PgSslMode::VerifyCa)
@@ -437,6 +439,11 @@ impl PgConnectOptions {
     /// ```
     pub fn application_name(mut self, application_name: &str) -> Self {
         self.application_name = Some(application_name.to_owned());
+        self
+    }
+
+    pub fn replication(mut self, replication: &str) -> Self {
+        self.replication = Some(replication.to_owned());
         self
     }
 
@@ -633,6 +640,10 @@ impl PgConnectOptions {
     /// ```
     pub fn get_application_name(&self) -> Option<&str> {
         self.application_name.as_deref()
+    }
+
+    pub fn get_replication(&self) -> Option<&str> {
+        self.replication.as_deref()
     }
 
     /// Get the options.
