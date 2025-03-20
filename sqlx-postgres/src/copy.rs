@@ -1,9 +1,11 @@
 use std::borrow::Cow;
 use std::ops::{Deref, DerefMut};
+use std::pin::pin;
 
 use futures_core::future::BoxFuture;
 use futures_core::stream::BoxStream;
 
+use futures_util::FutureExt;
 use sqlx_core::bytes::{BufMut, Bytes};
 
 use crate::connection::PgConnection;
@@ -11,8 +13,8 @@ use crate::error::{Error, Result};
 use crate::ext::async_stream::TryAsyncStream;
 use crate::io::AsyncRead;
 use crate::message::{
-    BackendMessageFormat, CommandComplete, CopyData, CopyDone, CopyFail, CopyInResponse,
-    CopyOutResponse, CopyResponseData, Query, ReadyForQuery,
+    BackendMessageFormat, CommandComplete, CopyBothResponse, CopyData, CopyDone, CopyFail,
+    CopyInResponse, CopyOutResponse, CopyResponseData, Query, ReadyForQuery,
 };
 use crate::pool::{Pool, PoolConnection};
 use crate::Postgres;
@@ -60,6 +62,10 @@ impl PgConnection {
         statement: &str,
     ) -> Result<BoxStream<'c, Result<Bytes>>> {
         pg_begin_copy_out(self, statement).await
+    }
+
+    pub async fn copy_both_raw(&mut self, statement: &str) -> Result<PgCopyBoth<&mut Self>> {
+        PgCopyBoth::begin(self, statement).await
     }
 }
 
@@ -111,6 +117,11 @@ pub trait PgPoolCopyExt {
         &'a self,
         statement: &'a str,
     ) -> BoxFuture<'a, Result<BoxStream<'static, Result<Bytes>>>>;
+
+    fn copy_both_raw<'a>(
+        &'a self,
+        statement: &'a str,
+    ) -> BoxFuture<'a, Result<PgCopyBoth<PoolConnection<Postgres>>>>;
 }
 
 impl PgPoolCopyExt for Pool<Postgres> {
@@ -126,6 +137,13 @@ impl PgPoolCopyExt for Pool<Postgres> {
         statement: &'a str,
     ) -> BoxFuture<'a, Result<BoxStream<'static, Result<Bytes>>>> {
         Box::pin(async { pg_begin_copy_out(self.acquire().await?, statement).await })
+    }
+
+    fn copy_both_raw<'a>(
+        &'a self,
+        statement: &'a str,
+    ) -> BoxFuture<'a, Result<PgCopyBoth<PoolConnection<Postgres>>>> {
+        Box::pin(async { PgCopyBoth::begin(self.acquire().await?, statement).await })
     }
 }
 
@@ -349,4 +367,182 @@ async fn pg_begin_copy_out<'c, C: DerefMut<Target = PgConnection> + Send + 'c>(
     };
 
     Ok(Box::pin(stream))
+}
+
+// https://www.postgresql.org/docs/current/protocol-flow.html#PROTOCOL-COPY
+#[must_use = "connection will error on next use if `.finish()` or `.abort()` is not called"]
+pub struct PgCopyBoth<C: DerefMut<Target = PgConnection>> {
+    conn: Option<C>,
+    response: CopyResponseData,
+    state: CopyBothState,
+}
+
+impl<'c, C: DerefMut<Target = PgConnection> + Send + Sync> PgCopyBoth<C> {
+    async fn begin(mut conn: C, statement: &str) -> Result<Self> {
+        // Send request
+        conn.wait_until_ready().await?;
+        conn.inner.stream.send(Query(statement)).await?;
+
+        // BE responds with CopyBothResponse
+        let response = match conn.inner.stream.recv_expect::<CopyBothResponse>().await {
+            Ok(res) => res.0,
+            Err(e) => {
+                conn.inner.stream.recv().await?;
+                return Err(e);
+            }
+        };
+
+        Ok(PgCopyBoth {
+            conn: Some(conn),
+            response,
+            state: CopyBothState::CopyBoth,
+        })
+    }
+
+    pub async fn send(&mut self, data: impl Deref<Target = [u8]>) -> Result<&mut Self> {
+        self.conn
+            .as_deref_mut()
+            .expect("send_data: conn taken")
+            .inner
+            .stream
+            .send(CopyData(data))
+            .await?;
+
+        Ok(self)
+    }
+
+    pub async fn read_from(&mut self, mut source: impl AsyncRead + Unpin) -> Result<&mut Self> {
+        let conn: &mut PgConnection = self.conn.as_deref_mut().expect("copy_from: conn taken");
+        loop {
+            let buf = conn.inner.stream.write_buffer_mut();
+
+            // Write the CopyData format code and reserve space for the length.
+            // This may end up sending an empty `CopyData` packet if, after this point,
+            // we get canceled or read 0 bytes, but that should be fine.
+            buf.put_slice(b"d\0\0\0\x04");
+
+            let read = buf.read_from(&mut source).await?;
+
+            if read == 0 {
+                break;
+            }
+
+            // Write the length
+            let read32 = u32::try_from(read)
+                .map_err(|_| err_protocol!("number of bytes read exceeds 2^32: {}", read))?;
+
+            (&mut buf.get_mut()[1..]).put_u32(read32 + 4);
+
+            conn.inner.stream.flush().await?;
+        }
+
+        Ok(self)
+    }
+
+    pub async fn abort(mut self, msg: impl Into<String>) -> Result<()> {
+        let mut conn = self
+            .conn
+            .take()
+            .expect("PgCopyBoth::fail_with: conn taken illegally");
+
+        conn.inner.stream.send(CopyFail::new(msg)).await?;
+
+        match conn.inner.stream.recv().await {
+            Ok(msg) => Err(err_protocol!(
+                "fail_with: expected ErrorResponse, got: {:?}",
+                msg.format
+            )),
+            Err(Error::Database(e)) => {
+                match e.code() {
+                    Some(Cow::Borrowed("57014")) => {
+                        // postgres abort received error code
+                        conn.inner.stream.recv_expect::<ReadyForQuery>().await?;
+                        Ok(())
+                    }
+                    _ => Err(Error::Database(e)),
+                }
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    pub async fn receive(&mut self) -> Result<Option<Bytes>> {
+        let Some(ref mut conn) = self.conn else {
+            return Err(err_protocol!("asdf"));
+        };
+        match conn.inner.stream.recv().await {
+            Err(e) => {
+                conn.inner.stream.recv_expect::<ReadyForQuery>().await?;
+                Err(e)
+            }
+            Ok(msg) => match msg.format {
+                BackendMessageFormat::CopyData => Ok(Some(msg.decode::<CopyData<Bytes>>()?.0)),
+                BackendMessageFormat::CopyDone => {
+                    let _ = msg.decode::<CopyDone>()?;
+                    conn.inner.stream.recv_expect::<CommandComplete>().await?;
+                    conn.inner.stream.recv_expect::<ReadyForQuery>().await?;
+                    Ok(None)
+                }
+                _ => Err(err_protocol!(
+                    "unexpected message format during copy out: {:?}",
+                    msg.format
+                )),
+            },
+        }
+    }
+
+    pub async fn finish(mut self) -> Result<u64> {
+        let mut conn = self
+            .conn
+            .take()
+            .expect("CopyWriter::finish: conn taken illegally");
+
+        conn.inner.stream.send(CopyDone).await?;
+        let cc: CommandComplete = match conn.inner.stream.recv_expect().await {
+            Ok(cc) => cc,
+            Err(e) => {
+                conn.inner.stream.recv().await?;
+                return Err(e);
+            }
+        };
+
+        conn.inner.stream.recv_expect::<ReadyForQuery>().await?;
+
+        Ok(cc.rows_affected())
+    }
+}
+
+impl<C: DerefMut<Target = PgConnection>> Drop for PgCopyBoth<C> {
+    fn drop(&mut self) {
+        if let Some(mut conn) = self.conn.take() {
+            conn.inner
+                .stream
+                .write_msg(CopyFail::new(
+                    "PgCopyBoth dropped without calling finish() or fail()",
+                ))
+                .expect("BUG: PgCopyBoth abort message should not be too large");
+        }
+    }
+}
+
+impl<C: DerefMut<Target = PgConnection> + Send + Sync + Unpin> futures_core::Stream
+    for PgCopyBoth<C>
+{
+    type Item = Result<Bytes>;
+
+    fn poll_next(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        pin!(self.receive()).poll_unpin(cx).map(|r| r.transpose())
+    }
+}
+
+pub enum CopyBothState {
+    CopyBoth,
+    CopyOut,
+    CopyIn,
+    CopyNone,
+    CopyComplete,
+    CommandComplete,
 }
